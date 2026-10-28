@@ -1,0 +1,99 @@
+# Đặt file này ở: .github/workflows/build-a50s-kernel.yml
+# Chạy: tab Actions -> "Build A50s kernel" -> Run workflow
+# Kết quả: 1 file zip duy nhất ở tab Releases (tải trực tiếp).
+#
+# Lần đầu: tick "help_only" để xem danh sách flag của build.sh trong log
+# (tên variant One UI 4+...), rồi chạy lại và điền "build_args" cho đúng.
+
+name: Build A50s kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repo source kernel (owner/name)"
+        default: "ezera23/android_kernel_samsung_exynos9610_mint"
+      branch:
+        description: "Nhánh của repo source"
+        default: "android-11.0"
+      build_args:
+        description: "Tham số truyền cho build.sh (xem --help trong log)"
+        default: "-d a50s"
+      help_only:
+        description: "Chỉ in ./build.sh --help rồi dừng"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # cần để tạo Release
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      SRC_REPO: ${{ inputs.repo }}
+      SRC_BRANCH: ${{ inputs.branch }}
+      BUILD_ARGS: ${{ inputs.build_args }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.branch }}
+          path: kernel
+          fetch-depth: 0 # một số build.sh dùng git history để đặt version
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libelf-dev bzip2 bc p7zip-full jq git python3 python-is-python3 \
+            lib32stdc++6 libc6-dev-i386 flex bison libssl-dev zip unzip curl cpio xz-utils
+
+      - name: Show build.sh options
+        working-directory: kernel
+        run: |
+          chmod +x build.sh
+          ./build.sh --help || true
+
+      - name: Build kernel
+        if: ${{ !inputs.help_only }}
+        working-directory: kernel
+        run: |
+          touch "$RUNNER_TEMP/stamp"
+          ./build.sh $BUILD_ARGS
+
+      - name: Pick the flashable zip
+        id: pick
+        if: ${{ !inputs.help_only }}
+        working-directory: kernel
+        run: |
+          ZIP=$(find . -type f -name '*.zip' -newer "$RUNNER_TEMP/stamp" -not -path './.git/*' \
+                  -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+          if [ -z "$ZIP" ]; then
+            echo "::error::build.sh không tạo ra file .zip. Các file Image/img mới sau build:"
+            find . -type f \( -name 'Image*' -o -name '*.img' \) -newer "$RUNNER_TEMP/stamp" \
+              -not -path './.git/*' | head -n 20
+            exit 1
+          fi
+          OUT="$GITHUB_WORKSPACE/a50s-kernel-${SRC_BRANCH//\//-}-$(date +%Y%m%d).zip"
+          cp "$ZIP" "$OUT"
+          echo "Chọn: $ZIP -> $OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release (1 file, tải trực tiếp)
+        if: ${{ !inputs.help_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_ZIP: ${{ steps.pick.outputs.file }}
+        run: |
+          gh release create "a50s-${{ github.run_number }}.${{ github.run_attempt }}" "$KERNEL_ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "A50s kernel #${{ github.run_number }}" \
+            --notes "Source: $SRC_REPO @ $SRC_BRANCH | build.sh $BUILD_ARGS"
